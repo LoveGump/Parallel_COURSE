@@ -6,15 +6,15 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
-#include <omp.h>
+// #include <omp.h>
 #include <arm_neon.h>
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
 
+#include "Mentgomery32.h"
 #include "Montgomery.h"
-#include "simd_openmp_ntt.h"
 
 // 可以自行添加需要的头文件
 
@@ -1257,35 +1257,47 @@ int main(int argc, char *argv[]) {
     // 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久,
     // 推荐调试正确性时只使用输入文件 1
-    
     int test_begin = 0;
     int test_end = 4;
-    
-    // 设置OpenMP线程数
-    int num_threads = omp_get_max_threads();
-    std::cout << "Using " << num_threads << " threads for SIMD + OpenMP hybrid parallel NTT" << std::endl;
-    
     for (int i = test_begin; i <= test_end; ++i) {
         long double ans = 0;
         int n_, p_;
         fRead(a, b, &n_, &p_, i);
         memset(ab, 0, sizeof(ab));
-        
         auto Start = std::chrono::high_resolution_clock::now();
-        
-        // 使用SIMD + OpenMP混合并行版本
-        NTT_multiply_simd_openmp(a, b, ab, n_, p_, num_threads);
-        
+        // TODO : 将 poly_multiply 函数替换成你写的 ntt
+        poly_multiply(a, b, ab, n_, p_);
+        // FFT_multiply(a, b, ab, n_, p_);
+        // ntt 初始版本
+        NTT_multiply(a, b, ab, n_, p_);
+        // ntt 使用蒙哥马利 模乘 的版本
+        // NTT_multiply_Montgomery(a, b, ab, n_, p_);
+        // ntt使用蒙哥马利 域 的版本
+        // NTT_multiply_Montgomerybase2(a, b, ab, n_, p_);
+
+        // NTT_multiply_base4_(a, b, ab, n_, p_);
+        // ntt使用基4 - 蒙哥马利模乘的版本
+        // NTT_multiply_base4(a, b, ab, n_, p_);
+        // NTT_multiply_base4_m(a, b, ab, n_, p_);
+        // NTT_multiply_base4_NEON(a, b, ab, n_, p_);
+        // ntt 使用基4 - 蒙哥马利域的版本
+        // NTT_multiply_base4_Montgomery(a, b, ab, n_, p_);
+        // 小于32位优化的蒙哥马利域基4 NTT
+        // NTT_multiply_base4_Montgomery_domain(a, b, ab, n_, p_);
+        // NTT_multiply_base4_Montgomery32(a, b, ab, n_, p_);
+        // NTT_multiply_base4_Montgomery32neon(a, b, ab, n_, p_);
+
         auto End = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::ratio<1, 1000>> elapsed = End - Start;
+        std::chrono::duration<double, std::ratio<1, 1000>> elapsed =
+            End - Start;
         ans += elapsed.count();
-        
         fCheck(ab, n_, i);
-        std::cout << "SIMD + OpenMP hybrid - n = " << n_ << " p = " << p_ 
-                  << " : " << ans << " (ms) " << std::endl;
+        std::cout << "average latency for n = " << n_ << " p = " << p_ << " : "
+                  << ans << " (us) " << std::endl;
+        // 可以使用 fWrite 函数将 ab 的输出结果打印到 files 文件夹下
+        // 禁止使用 cout 一次性输出大量文件内容
         fWrite(ab, n_, i);
     }
-    
-    std::cout << "All test cases passed with SIMD + OpenMP hybrid parallelization!" << std::endl;
+    std::cout << "all test cases passed!34" << std::endl;
     return 0;
 }
