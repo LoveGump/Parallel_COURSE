@@ -1,6 +1,5 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <omp.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -189,15 +188,12 @@ __global__ void ntt_stage_kernel_table(uint64_t *a, const uint64_t *g_pows,
     }
 }
 
-// Host 端 GPU NTT - OpenMP 优化版本
+// Host 端 GPU NTT
 void compute_bitrev(int *h_rev, int n) {
     int bit = 0;
     while ((1 << bit) < n)
         ++bit;
     h_rev[0] = 0;
-    
-    // OpenMP 并行化位反转表计算
-    #pragma omp parallel for schedule(static) if(n > 1024)
     for (int i = 1; i < n; ++i) {
         h_rev[i] = (h_rev[i >> 1] >> 1) | ((i & 1) << (bit - 1));
     }
@@ -323,62 +319,6 @@ void NTT_multiply_cuda(const uint64_t *h_a, const uint64_t *h_b, uint64_t *h_res
     destroy_twiddle_pool(pool);
 }
 
-// OpenMP + CUDA 混合优化版本
-void NTT_multiply_cuda_openmp(const uint64_t *h_a, const uint64_t *h_b, uint64_t *h_res, int n, uint64_t p, cudaStream_t stream = 0) {
-    int len = n << 1;
-    size_t bytes = len * sizeof(uint64_t);
-
-    // 使用内存池避免频繁分配
-    g_mem_pool.init(bytes);
-    uint64_t *d_fa = g_mem_pool.d_buffer1;
-    uint64_t *d_fb = g_mem_pool.d_buffer2;
-
-    // 根据数据规模决定是否使用OpenMP并行初始化
-    if (n > 8192) {
-        // 大规模数据使用OpenMP并行初始化GPU内存
-        #pragma omp parallel sections
-        {
-            #pragma omp section
-            cudaMemset(d_fa, 0, bytes);
-            #pragma omp section 
-            cudaMemset(d_fb, 0, bytes);
-        }
-    } else {
-        // 小规模数据串行处理避免开销
-        cudaMemset(d_fa, 0, bytes);
-        cudaMemset(d_fb, 0, bytes);
-    }
-
-    // 数据传输
-    cudaMemcpyAsync(d_fa, h_a, n * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_fb, h_b, n * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
-
-    // 构建旋转因子池
-    TwiddlePool pool;
-    build_twiddle_pool(len, p, 3, pool);
-
-    // 前向 NTT
-    NTT_cuda(d_fa, len, false, p, pool, stream);
-    NTT_cuda(d_fb, len, false, p, pool, stream);
-
-    Barrett br(p);
-    // 点值相乘
-    int block = 256;
-    int grid = (len + block - 1) / block;
-    multiply_pointwise_kernel_vec<<<grid, block, 0, stream>>>(d_fa, d_fb, br, len);
-
-    cudaStreamSynchronize(stream);
-
-    // 逆向 NTT
-    NTT_cuda(d_fa, len, true, p, pool, stream);
-
-    // 异步数据传输回主机
-    cudaMemcpyAsync(h_res, d_fa, (2 * n - 1) * sizeof(uint64_t),
-                    cudaMemcpyDeviceToHost, stream);
-
-    destroy_twiddle_pool(pool);
-}
-
 // CRT + CUDA 
 void CRT_NTT_multiply_cuda(uint64_t *a, uint64_t *b, uint64_t *result, int n, uint64_t p) {
     constexpr int MOD_COUNT = 4;
@@ -436,7 +376,6 @@ void CRT_NTT_multiply_cuda(uint64_t *a, uint64_t *b, uint64_t *result, int n, ui
         cudaStreamDestroy(streams[i]);
 
 // CRT 合并 (CPU)  opm并行化
-#pragma omp parallel for
     for (int j = 0; j < result_len; ++j) {
         __uint128_t sum = 0;
         for (int i = 0; i < MOD_COUNT; ++i) {
@@ -454,109 +393,6 @@ void CRT_NTT_multiply_cuda(uint64_t *a, uint64_t *b, uint64_t *result, int n, ui
         cudaFreeHost(h_ta[i]);
         cudaFreeHost(h_tb[i]);
     }
-}
-
-// 多GPU + OpenMP 终极优化版本
-void CRT_NTT_multiply_multigpu_openmp(uint64_t *a, uint64_t *b, uint64_t *result, int n, uint64_t p) {
-    constexpr int MOD_COUNT = 4;
-    const uint64_t MOD_LIST[MOD_COUNT] = {1004535809ULL, 1224736769ULL, 469762049ULL, 998244353ULL};
-    int result_len = (n << 1) - 1;
-    
-    // 获取GPU数量
-    int gpu_count = 1;
-    cudaGetDeviceCount(&gpu_count);
-    gpu_count = std::min(gpu_count, MOD_COUNT);
-    
-    // 设置OpenMP线程数为逻辑核心数
-    omp_set_num_threads(omp_get_max_threads());
-    
-    // 使用对齐内存分配提高缓存性能
-    uint64_t *mod_results[MOD_COUNT];
-    #pragma omp parallel for
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        cudaMallocHost(&mod_results[i], result_len * sizeof(uint64_t));
-        memset(mod_results[i], 0, result_len * sizeof(uint64_t));
-    }
-
-    // 预计算CRT常数
-    __uint128_t M = 1;
-    for (int i = 0; i < MOD_COUNT; ++i)
-        M *= MOD_LIST[i];
-
-    __uint128_t MI_VALUES[MOD_COUNT];
-    uint64_t MI_INV_VALUES[MOD_COUNT];
-
-    #pragma omp parallel for
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        MI_VALUES[i] = M / MOD_LIST[i];
-        Barrett br(MOD_LIST[i]);
-        uint64_t Mi_mod = MI_VALUES[i] % MOD_LIST[i];
-        MI_INV_VALUES[i] = pow_mod(Mi_mod, MOD_LIST[i] - 2, br);
-    }
-
-    // 多GPU + 多stream 并行处理
-    cudaStream_t streams[MOD_COUNT];
-    uint64_t *h_ta[MOD_COUNT], *h_tb[MOD_COUNT];
-    
-    // 序列化初始化，避免竞争条件
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        // 设置GPU设备（轮询分配）
-        cudaSetDevice(i % gpu_count);
-        cudaStreamCreate(&streams[i]);
-        
-        cudaMallocHost(&h_ta[i], n * sizeof(uint64_t));
-        cudaMallocHost(&h_tb[i], n * sizeof(uint64_t));
-    }
-    
-    // 并行预处理数据
-    #pragma omp parallel for if(n > 8192)
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        // 模数约简预处理
-        Barrett br(MOD_LIST[i]);
-        for (int j = 0; j < n; ++j) {
-            h_ta[i][j] = br.reduce(a[j]);
-            h_tb[i][j] = br.reduce(b[j]);
-        }
-    }
-    
-    // 串行执行NTT运算避免GPU竞争
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        cudaSetDevice(i % gpu_count);
-        NTT_multiply_cuda_openmp(h_ta[i], h_tb[i], mod_results[i], n, MOD_LIST[i], streams[i]);
-    }
-
-    // 同步所有streams
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        cudaSetDevice(i % gpu_count);
-        cudaStreamSynchronize(streams[i]);
-        cudaStreamDestroy(streams[i]);
-    }
-
-    // CRT合并 - 保守的OpenMP优化版本
-    #pragma omp parallel for schedule(static, 64) num_threads(omp_get_max_threads()) if(result_len > 1024)
-    for (int j = 0; j < result_len; ++j) {
-        __uint128_t sum = 0;
-        
-        // 手动展开内循环以提高性能
-        for (int i = 0; i < MOD_COUNT; ++i) {
-            __uint128_t term = MI_VALUES[i] * ((mod_results[i][j] * MI_INV_VALUES[i]) % MOD_LIST[i]);
-            sum += term;
-        }
-        
-        sum %= M;
-        result[j] = static_cast<uint64_t>(sum % p);
-    }
-
-    // 清理资源
-    #pragma omp parallel for
-    for (int i = 0; i < MOD_COUNT; ++i) {
-        cudaFreeHost(mod_results[i]);
-        cudaFreeHost(h_ta[i]);
-        cudaFreeHost(h_tb[i]);
-    }
-    
-    // 恢复GPU 0
-    cudaSetDevice(0);
 }
 
 void fRead(uint64_t *a, uint64_t *b, int *n, uint64_t *p, int input_id) {
@@ -604,81 +440,36 @@ void fWrite(uint64_t *ab, int n, int input_id) {
         fout << ab[i] << '\n';
 }
 
-// 主函数 - OpenMP + CUDA 优化版本
+// 主函数
 int main() {
     // 选择 GPU 0
     cudaSetDevice(0);
     // 预热：触发 CUDA 上下文初始化，避免计时包含启动开销
     cudaFree(0);
-    
-    // 设置OpenMP参数
-    omp_set_num_threads(omp_get_max_threads());
-    omp_set_nested(1);  // 启用嵌套并行
-    
-    std::cout << "使用 " << omp_get_max_threads() << " 个OpenMP线程" << std::endl;
-    
-    int gpu_count;
-    cudaGetDeviceCount(&gpu_count);
-    std::cout << "检测到 " << gpu_count << " 个GPU设备" << std::endl;
 
-    static uint64_t a[300000], b[300000], ab[300000], ab_openmp[300000];
+    static uint64_t a[300000], b[300000], ab[300000];
 
     int test_begin = 0;
     int test_end = 4;
 
-    std::cout << "\n=== OpenMP + CUDA 优化性能测试 ===" << std::endl;
-    
     for (int idx = test_begin; idx <= test_end; ++idx) {
         int n;
         uint64_t p;
         fRead(a, b, &n, &p, idx);
-        std::fill(ab, ab + (2 * n), 0ull);
-        std::fill(ab_openmp, ab_openmp + (2 * n ), 0ull);
+        std::fill(ab, ab + (2 * n - 1), 0ull);
 
-        std::cout << "\n测试用例 " << idx << ": n = " << n << ", p = " << p << std::endl;
-        
-        // 原版CUDA实现
-        auto start1 = std::chrono::high_resolution_clock::now();
+        auto start = std::chrono::high_resolution_clock::now();
         if (p > (1ULL << 32)) {
             CRT_NTT_multiply_cuda(a, b, ab, n, p);
         } else {
             NTT_multiply_cuda(a, b, ab, n, p);
         }
-        auto end1 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed1 = end1 - start1;
-        
-        // OpenMP + CUDA 优化版本
-        fRead(a, b, &n, &p, idx);
-        auto start2 = std::chrono::high_resolution_clock::now();
-        if (p > (1ULL << 32)) {
-            // if (gpu_count > 1) {
-            //     CRT_NTT_multiply_multigpu_openmp(a, b, ab_openmp, n, p);
-            // } else {
-                CRT_NTT_multiply_cuda(a, b, ab_openmp, n, p);  // 使用已优化的单GPU版本
-            // }
-        } else {
-            NTT_multiply_cuda_openmp(a, b, ab_openmp, n, p);
-        }
-        auto end2 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed2 = end2 - start2;
-        // 验证结果正确性
-        bool results_match = true;
-        for (int i = 0; i < 2 * n - 1; ++i) {
-            if (ab[i] != ab_openmp[i]) {
-                results_match = false;
-                break;
-            }
-        }
-        
-        std::cout << "原版CUDA时间: " << std::fixed << std::setprecision(3) << elapsed1.count() << " ms" << std::endl;
-        std::cout << "OpenMP+CUDA时间: " << std::fixed << std::setprecision(3) << elapsed2.count() << " ms" << std::endl;
-        std::cout << "加速比: " << std::fixed << std::setprecision(2) << elapsed1.count() / elapsed2.count() << "x" << std::endl;
-        std::cout << "结果正确性: " << (results_match ? "✓ 正确" : "✗ 错误") << std::endl;
-        
-        fCheck(ab_openmp, n, idx);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed = end - start;
+
         fCheck(ab, n, idx);
-        fWrite(ab_openmp, n, idx);
+        std::cout << "average latency for n = " << n << " p = " << p << " : " << elapsed.count() << " (ms)" << std::endl;
+        fWrite(ab, n, idx);
     }
-    
     return 0;
 }

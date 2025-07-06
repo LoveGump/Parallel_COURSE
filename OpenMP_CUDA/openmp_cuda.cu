@@ -379,92 +379,7 @@ void NTT_multiply_cuda_openmp(const uint64_t *h_a, const uint64_t *h_b, uint64_t
     destroy_twiddle_pool(pool);
 }
 
-// // CRT + CUDA 
-// void CRT_NTT_multiply_cuda(uint64_t *a, uint64_t *b, uint64_t *result, int n, uint64_t p) {
-//     constexpr int MOD_COUNT = 4;
-//     const uint64_t MOD_LIST[MOD_COUNT] = {1004535809ULL, 1224736769ULL, 469762049ULL, 998244353ULL};
-//     int result_len = (n << 1) - 1;
-
-//     // 使用对齐内存分配提高缓存性能
-//     uint64_t *mod_results[MOD_COUNT];  // 模数结果
-//     for (int i = 0; i < MOD_COUNT; ++i) {
-//         // 分配内存，并初始化为0
-//         cudaMallocHost(&mod_results[i], result_len * sizeof(uint64_t));
-//         memset(mod_results[i], 0, result_len * sizeof(uint64_t));
-//     }
-
-//     // 总模数 M
-//     __uint128_t M = 1;
-//     for (int i = 0; i < MOD_COUNT; ++i)
-//         M *= MOD_LIST[i];
-
-//     __uint128_t MI_VALUES[MOD_COUNT];
-//     uint64_t MI_INV_VALUES[MOD_COUNT];
-
-//     for (int i = 0; i < MOD_COUNT; ++i) {
-//         MI_VALUES[i] = M / MOD_LIST[i];
-//         Barrett br(MOD_LIST[i]);
-//         uint64_t Mi_mod = MI_VALUES[i] % MOD_LIST[i];
-//         MI_INV_VALUES[i] = pow_mod(Mi_mod, MOD_LIST[i] - 2, br);
-//     }
-
-//     // 为 4 个模数创建独立 CUDA stream，使用OpenMP并行化
-//     cudaStream_t streams[MOD_COUNT];
-//     #pragma omp parallel for
-//     for (int i = 0; i < MOD_COUNT; ++i)
-//         cudaStreamCreate(&streams[i]);
-
-//     // 使用页锁定内存避免拷贝开销，OpenMP并行分配
-//     uint64_t *h_ta[MOD_COUNT], *h_tb[MOD_COUNT];
-//     #pragma omp parallel for
-//     for (int i = 0; i < MOD_COUNT; ++i) {
-//         cudaMallocHost(&h_ta[i], n * sizeof(uint64_t));
-//         cudaMallocHost(&h_tb[i], n * sizeof(uint64_t));
-//     }
-
-//     // OpenMP并行化模数约简预处理
-//     #pragma omp parallel for if(n > 8192)
-//     for (int i = 0; i < MOD_COUNT; ++i) {
-//         Barrett br(MOD_LIST[i]);
-//         // 移除可能有问题的aligned指令，使用简单的向量化
-//         for (int j = 0; j < n; ++j) {
-//             h_ta[i][j] = br.reduce(a[j]);
-//             h_tb[i][j] = br.reduce(b[j]);
-//         }
-//         NTT_multiply_cuda(h_ta[i], h_tb[i], mod_results[i], n, MOD_LIST[i], streams[i]);
-//     }
-
-//     // 等待所有 stream 完成，OpenMP并行同步
-//     #pragma omp parallel for
-//     for (int i = 0; i < MOD_COUNT; ++i)
-//         cudaStreamSynchronize(streams[i]);
-//     #pragma omp parallel for
-//     for (int i = 0; i < MOD_COUNT; ++i)
-//         cudaStreamDestroy(streams[i]);
-
-// // CRT 合并 - OpenMP + SIMD 高度优化版本
-// #pragma omp parallel for schedule(static) num_threads(omp_get_max_threads()) if(result_len > 1024)
-//     for (int j = 0; j < result_len; ++j) {
-//         __uint128_t sum = 0;
-        
-//         // 简化的循环，移除可能有问题的SIMD指令
-//         for (int i = 0; i < MOD_COUNT; ++i) {
-//             __uint128_t term =
-//                 MI_VALUES[i] * ((mod_results[i][j] * MI_INV_VALUES[i]) % MOD_LIST[i]);
-//             sum += term;
-//         }
-//         sum %= M;
-//         result[j] = static_cast<uint64_t>(sum % p);
-//     }
-
-//     // 清理页锁定内存 - OpenMP并行化
-//     #pragma omp parallel for
-//     for (int i = 0; i < MOD_COUNT; ++i) {
-//         cudaFreeHost(mod_results[i]);
-//         cudaFreeHost(h_ta[i]);
-//         cudaFreeHost(h_tb[i]);
-//     }
-// }
+// CRT + CUDA 
 void CRT_NTT_multiply_cuda(uint64_t *a, uint64_t *b, uint64_t *result, int n, uint64_t p) {
     constexpr int MOD_COUNT = 4;
     const uint64_t MOD_LIST[MOD_COUNT] = {1004535809ULL, 1224736769ULL, 469762049ULL, 998244353ULL};
@@ -711,59 +626,34 @@ int main() {
     int test_begin = 0;
     int test_end = 4;
 
-    std::cout << "\n=== OpenMP + CUDA 优化性能测试 ===" << std::endl;
     
     for (int idx = test_begin; idx <= test_end; ++idx) {
         int n;
         uint64_t p;
         fRead(a, b, &n, &p, idx);
-        std::fill(ab, ab + (2 * n - 1), 0ull);
-        std::fill(ab_openmp, ab_openmp + (2 * n - 1), 0ull);
+        std::fill(ab, ab + (2 * n), 0ull);
+        std::fill(ab_openmp, ab_openmp + (2 * n ), 0ull);
 
         std::cout << "\n测试用例 " << idx << ": n = " << n << ", p = " << p << std::endl;
-        
-        // 原版CUDA实现
-        auto start1 = std::chrono::high_resolution_clock::now();
-        if (p > (1ULL << 32)) {
-            CRT_NTT_multiply_cuda(a, b, ab, n, p);
-        } else {
-            NTT_multiply_cuda(a, b, ab, n, p);
-        }
-        auto end1 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed1 = end1 - start1;
         
         // OpenMP + CUDA 优化版本
         fRead(a, b, &n, &p, idx);
         auto start2 = std::chrono::high_resolution_clock::now();
-        std::cout<<gpu_count<<std::endl;
         if (p > (1ULL << 32)) {
-            // if (gpu_count > 1) {
-            //     CRT_NTT_multiply_multigpu_openmp(a, b, ab_openmp, n, p);
-            // } else {
+            if (gpu_count > 1) {
+                CRT_NTT_multiply_multigpu_openmp(a, b, ab_openmp, n, p);
+            } else {
                 CRT_NTT_multiply_cuda(a, b, ab_openmp, n, p);  // 使用已优化的单GPU版本
-            // }
+            }
         } else {
             NTT_multiply_cuda_openmp(a, b, ab_openmp, n, p);
         }
         auto end2 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed2 = end2 - start2;
-        
-        // 验证结果正确性
-        bool results_match = true;
-        for (int i = 0; i < 2 * n - 1; ++i) {
-            if (ab[i] != ab_openmp[i]) {
-                results_match = false;
-                break;
-            }
-        }
-        
-        std::cout << "原版CUDA时间: " << std::fixed << std::setprecision(3) << elapsed1.count() << " ms" << std::endl;
         std::cout << "OpenMP+CUDA时间: " << std::fixed << std::setprecision(3) << elapsed2.count() << " ms" << std::endl;
-        std::cout << "加速比: " << std::fixed << std::setprecision(2) << elapsed1.count() / elapsed2.count() << "x" << std::endl;
-        std::cout << "结果正确性: " << (results_match ? "✓ 正确" : "✗ 错误") << std::endl;
+       
         
         fCheck(ab_openmp, n, idx);
-        fCheck(ab, n, idx);
         fWrite(ab_openmp, n, idx);
     }
     
